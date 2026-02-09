@@ -23,10 +23,9 @@ auth_tokens:
     type: 'cookie'
 
 auth_urls:
-  - '/ServiceLogin'
+  - '/v3/signin'
   - '/CheckCookie'
   - '/ManageAccount'
-  - '/v3/signin/challenge'
 
 credentials:
   username:
