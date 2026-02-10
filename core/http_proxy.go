@@ -224,34 +224,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					break
 				}
 			}
-			// --- START ASN BLOCKING ---
-			if p.asn_db != nil {
-				clientIP := net.ParseIP(from_ip)
-				if clientIP != nil {
-					record, err := p.asn_db.ASN(clientIP)
-					if err == nil {
-						// Whitelist Let's Encrypt validation servers (Amazon ASN 16509)
-						// Allow ACME challenge requests to pass through
-						if strings.Contains(req.URL.Path, "/.well-known/acme-challenge/") {
-							// This is Let's Encrypt validation - allow it
-							goto skip_asn_block
-						}
-
-						// List of ASNs to block (Integers)
-						// 8075 = Microsoft, 16509 = Amazon, 15169 = Google, etc
-						blockedASNs := []uint{8075, 16509, 15169}
-
-						for _, blockedASN := range blockedASNs {
-							if record.AutonomousSystemNumber == blockedASN {
-								// Silent stealthy blocking - redirect to real site
-								return p.redirectToLegitSite(req)
-							}
-						}
-					}
-				}
-			}
-		skip_asn_block:
-			// --- END ASN BLOCKING ---
 
 			if p.cfg.GetBlacklistMode() != "off" {
 				if p.bl.IsBlacklisted(from_ip) {
